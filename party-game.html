@@ -22,8 +22,10 @@
     <div id="app"></div>
 
     <script type="module">
-        // 游戏配置 - 使用 localStorage 作为简单存储
+        // 游戏配置 - 优化跨设备同步逻辑
         const STORAGE_KEY = 'party_game_rooms';
+        const ROOM_EXPIRE_TIME = 3600000; // 房间过期时间：1小时
+        const SYNC_INTERVAL = 1000; // 同步间隔：1秒（缩短刷新频率）
         
         // 词语库
         const wordPool = [
@@ -57,38 +59,80 @@
             ]
         };
 
-        // 存储管理
+        // 存储管理 - 优化跨设备/跨标签页同步
         class Storage {
             static getRooms() {
-                const data = localStorage.getItem(STORAGE_KEY);
-                return data ? JSON.parse(data) : {};
+                try {
+                    const data = localStorage.getItem(STORAGE_KEY);
+                    const rooms = data ? JSON.parse(data) : {};
+                    // 清理过期房间
+                    this.cleanExpiredRooms(rooms);
+                    return rooms;
+                } catch (e) {
+                    console.error('读取房间失败:', e);
+                    return {};
+                }
             }
 
             static saveRooms(rooms) {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(rooms));
-                // 触发存储事件，让其他标签页也能收到更新
-                window.dispatchEvent(new Event('storage'));
+                try {
+                    // 清理过期房间后再保存
+                    this.cleanExpiredRooms(rooms);
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(rooms));
+                    // 触发存储事件，让其他标签页同步
+                    window.dispatchEvent(new StorageEvent('storage', {
+                        key: STORAGE_KEY,
+                        newValue: JSON.stringify(rooms)
+                    }));
+                } catch (e) {
+                    console.error('保存房间失败:', e);
+                }
             }
 
             static getRoom(code) {
+                if (!code) return null;
+                // 强制统一房间号为大写，避免大小写不一致
+                const normalizedCode = code.trim().toUpperCase();
                 const rooms = this.getRooms();
-                return rooms[code] || null;
+                return rooms[normalizedCode] || null;
             }
 
             static setRoom(code, data) {
+                if (!code || !data) return;
+                const normalizedCode = code.trim().toUpperCase();
                 const rooms = this.getRooms();
-                rooms[code] = data;
+                // 补充房间更新时间，用于过期判断
+                data.updatedAt = Date.now();
+                rooms[normalizedCode] = data;
                 this.saveRooms(rooms);
             }
 
             static deleteRoom(code) {
+                const normalizedCode = code.trim().toUpperCase();
                 const rooms = this.getRooms();
-                delete rooms[code];
+                delete rooms[normalizedCode];
                 this.saveRooms(rooms);
+            }
+
+            // 清理过期房间
+            static cleanExpiredRooms(rooms) {
+                const now = Date.now();
+                for (const code in rooms) {
+                    const room = rooms[code];
+                    const roomTime = room.updatedAt || room.createdAt || 0;
+                    if (now - roomTime > ROOM_EXPIRE_TIME) {
+                        delete rooms[code];
+                    }
+                }
+            }
+
+            // 跨设备同步辅助：广播房间更新（仅同浏览器标签页生效）
+            static broadcastRoomUpdate() {
+                window.dispatchEvent(new CustomEvent('roomUpdated'));
             }
         }
 
-        // 游戏状态管理
+        // 游戏状态管理 - 修复加入房间核心问题
         class GameState {
             constructor() {
                 this.screen = 'home';
@@ -102,38 +146,74 @@
                 this.showHelp = false;
                 this.copied = false;
                 
-                // 监听存储变化
-                window.addEventListener('storage', () => {
+                // 监听存储变化（跨标签页）
+                window.addEventListener('storage', (e) => {
+                    if (e.key === STORAGE_KEY && this.roomCode) {
+                        this.loadRoom();
+                    }
+                });
+
+                // 监听自定义房间更新事件（同浏览器）
+                window.addEventListener('roomUpdated', () => {
                     if (this.roomCode) {
                         this.loadRoom();
                     }
                 });
 
-                // 定期刷新房间数据
+                // 缩短同步间隔，提升实时性
                 setInterval(() => {
                     if (this.roomCode && this.screen !== 'home') {
                         this.loadRoom();
                     }
-                }, 2000);
+                }, SYNC_INTERVAL);
+
+                // 初始化时加载房间（如果有缓存的roomCode）
+                this.initRoomFromCache();
             }
 
+            // 从缓存恢复房间（比如刷新页面后）
+            initRoomFromCache() {
+                const cachedRoomCode = localStorage.getItem('party_game_current_room');
+                const cachedPlayerId = localStorage.getItem('party_game_player_id');
+                if (cachedRoomCode && cachedPlayerId) {
+                    this.roomCode = cachedRoomCode;
+                    this.currentPlayerId = cachedPlayerId;
+                    this.loadRoom();
+                }
+            }
+
+            // 优化房间加载逻辑
             loadRoom() {
                 const room = Storage.getRoom(this.roomCode);
                 if (room) {
                     this.gameData = room;
+                    // 保存当前房间和玩家ID到缓存
+                    localStorage.setItem('party_game_current_room', this.roomCode);
+                    localStorage.setItem('party_game_player_id', this.currentPlayerId);
                     if (room.started && this.screen === 'lobby') {
                         this.screen = 'playing';
                     }
                     this.render();
+                } else {
+                    // 房间不存在时清空缓存
+                    localStorage.removeItem('party_game_current_room');
+                    localStorage.removeItem('party_game_player_id');
+                    if (this.screen !== 'home') {
+                        alert('房间已过期或不存在，请重新创建/加入');
+                        this.screen = 'home';
+                        this.render();
+                    }
                 }
             }
 
+            // 优化创建房间逻辑
             createRoom() {
                 if (!this.playerName.trim()) {
                     alert('请输入你的名字');
                     return;
                 }
 
+                // 生成更稳定的6位大写房间号
                 const code = Math.random().toString(36).substring(2, 8).toUpperCase();
                 const playerId = Math.random().toString(36).substring(2, 15);
                 
@@ -153,10 +233,14 @@
                     started: false,
                     currentTurn: 0,
                     winner: null,
-                    createdAt: Date.now()
+                    createdAt: Date.now(),
+                    updatedAt: Date.now()
                 };
 
+                // 保存房间
                 Storage.setRoom(code, game);
+                // 广播更新
+                Storage.broadcastRoomUpdate();
                 
                 this.roomCode = code;
                 this.currentPlayerId = playerId;
@@ -165,40 +249,58 @@
                 this.render();
             }
 
+            // 修复加入房间核心逻辑
             joinRoom() {
-                if (!this.playerName.trim() || !this.roomCode.trim()) {
-                    alert('请输入名字和房间号');
+                if (!this.playerName.trim()) {
+                    alert('请输入你的名字');
+                    return;
+                }
+                if (!this.roomCode.trim()) {
+                    alert('请输入房间号');
                     return;
                 }
 
-                const game = Storage.getRoom(this.roomCode.toUpperCase());
+                // 统一房间号格式
+                const normalizedCode = this.roomCode.trim().toUpperCase();
+                const game = Storage.getRoom(normalizedCode);
                 
                 if (!game) {
-                    alert('房间不存在');
+                    alert('房间不存在！请检查房间号是否正确，或房间已过期');
                     return;
                 }
 
                 if (game.players.length >= game.maxPlayers) {
-                    alert('房间已满');
+                    alert(`房间已满（最多${game.maxPlayers}人）`);
                     return;
                 }
 
                 if (game.started) {
-                    alert('游戏已开始');
+                    alert('游戏已开始，无法加入');
+                    return;
+                }
+
+                // 检查是否已加入该房间
+                const isAlreadyJoined = game.players.some(p => 
+                    p.name === this.playerName.trim()
+                );
+                if (isAlreadyJoined) {
+                    alert('该名字已加入房间，请更换名字');
                     return;
                 }
 
                 const playerId = Math.random().toString(36).substring(2, 15);
                 const newPlayer = {
                     id: playerId,
-                    name: this.playerName,
+                    name: this.playerName.trim(),
                     word: game.words[game.players.length],
                     guessed: false,
                     order: game.players.length
                 };
 
                 game.players.push(newPlayer);
-                Storage.setRoom(this.roomCode.toUpperCase(), game);
+                game.updatedAt = Date.now(); // 更新房间时间
+                Storage.setRoom(normalizedCode, game);
+                Storage.broadcastRoomUpdate(); // 广播更新
 
                 this.currentPlayerId = playerId;
                 this.gameData = game;
@@ -207,13 +309,16 @@
             }
 
             startGame() {
+                if (!this.gameData) return;
                 if (this.gameData.players.length < 2) {
                     alert('至少需要2名玩家才能开始');
                     return;
                 }
 
                 this.gameData.started = true;
+                this.gameData.updatedAt = Date.now();
                 Storage.setRoom(this.roomCode, this.gameData);
+                Storage.broadcastRoomUpdate();
                 this.screen = 'playing';
                 this.render();
             }
@@ -223,15 +328,19 @@
                     alert('请输入你的猜测');
                     return;
                 }
+                if (!this.gameData) return;
 
                 const currentPlayer = this.gameData.players.find(p => p.id === this.currentPlayerId);
+                if (!currentPlayer) return;
                 
                 if (this.guessInput.trim() === currentPlayer.word) {
                     const playerIndex = this.gameData.players.findIndex(p => p.id === this.currentPlayerId);
                     this.gameData.players[playerIndex].guessed = true;
                     this.gameData.winner = currentPlayer.name;
+                    this.gameData.updatedAt = Date.now();
                     
                     Storage.setRoom(this.roomCode, this.gameData);
+                    Storage.broadcastRoomUpdate();
                     this.guessInput = '';
                     this.render();
                 } else {
@@ -242,6 +351,7 @@
             }
 
             triggerTruthOrDare() {
+                if (!this.gameData) return;
                 const randomPlayer = this.gameData.players[Math.floor(Math.random() * this.gameData.players.length)];
                 const type = Math.random() > 0.5 ? 'truth' : 'dare';
                 const challenge = truthOrDarePool[type][Math.floor(Math.random() * truthOrDarePool[type].length)];
@@ -256,13 +366,31 @@
             }
 
             copyRoomCode() {
-                navigator.clipboard.writeText(this.roomCode);
-                this.copied = true;
-                this.render();
-                setTimeout(() => {
-                    this.copied = false;
-                    this.render();
-                }, 2000);
+                if (!this.roomCode) return;
+                navigator.clipboard.writeText(this.roomCode)
+                    .then(() => {
+                        this.copied = true;
+                        this.render();
+                        setTimeout(() => {
+                            this.copied = false;
+                            this.render();
+                        }, 2000);
+                    })
+                    .catch(() => {
+                        // 降级方案：手动选中房间号
+                        const tempInput = document.createElement('input');
+                        tempInput.value = this.roomCode;
+                        document.body.appendChild(tempInput);
+                        tempInput.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(tempInput);
+                        this.copied = true;
+                        this.render();
+                        setTimeout(() => {
+                            this.copied = false;
+                            this.render();
+                        }, 2000);
+                    });
             }
 
             render() {
@@ -289,7 +417,13 @@
 
                 // 返回按钮
                 const backBtn = document.getElementById('backBtn');
-                if (backBtn) backBtn.onclick = () => { this.screen = 'home'; this.render(); };
+                if (backBtn) backBtn.onclick = () => { 
+                    // 返回主页时清空缓存
+                    localStorage.removeItem('party_game_current_room');
+                    localStorage.removeItem('party_game_player_id');
+                    this.screen = 'home'; 
+                    this.render(); 
+                };
 
                 // 创建房间
                 const playerNameInput = document.getElementById('playerNameInput');
@@ -306,13 +440,17 @@
                 }
                 if (createRoomBtn) createRoomBtn.onclick = () => this.createRoom();
 
-                // 加入房间
+                // 加入房间 - 实时统一房间号为大写
                 const roomCodeInput = document.getElementById('roomCodeInput');
                 const joinRoomBtn = document.getElementById('joinRoomBtn');
                 
                 if (roomCodeInput) {
                     roomCodeInput.value = this.roomCode;
-                    roomCodeInput.oninput = (e) => { this.roomCode = e.target.value.toUpperCase(); };
+                    roomCodeInput.oninput = (e) => { 
+                        // 输入时自动转为大写，避免用户输入小写
+                        this.roomCode = e.target.value.toUpperCase(); 
+                        e.target.value = this.roomCode;
+                    };
                 }
                 if (joinRoomBtn) joinRoomBtn.onclick = () => this.joinRoom();
 
@@ -343,6 +481,9 @@
                 if (truthOrDareBtn) truthOrDareBtn.onclick = () => this.triggerTruthOrDare();
                 if (continuePlaying) continuePlaying.onclick = () => { this.screen = 'playing'; this.render(); };
                 if (returnHome) returnHome.onclick = () => {
+                    // 返回主页时清空缓存
+                    localStorage.removeItem('party_game_current_room');
+                    localStorage.removeItem('party_game_player_id');
                     this.screen = 'home';
                     this.gameData = null;
                     this.roomCode = '';
@@ -415,97 +556,61 @@
                 `;
             }
 
-            getHelpModalHTML() {
-                return `
-                    <div id="helpOverlay" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-                        <div class="bg-gradient-to-br from-purple-900 to-pink-900 rounded-3xl p-8 max-w-lg w-full border-2 border-white/30 shadow-2xl" onclick="event.stopPropagation()">
-                            <h3 class="text-3xl font-black text-white mb-6 text-center" style="font-family: Impact, sans-serif">
-                                📱 如何和朋友一起玩？
-                            </h3>
-                            
-                            <div class="space-y-4 text-white">
-                                <div class="bg-white/10 rounded-xl p-4">
-                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
-                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">1</span>
-                                        分享这个游戏网址
-                                    </h4>
-                                    <p class="text-sm text-white/90 ml-8">
-                                        复制当前网页的网址，发送给朋友（微信、QQ、钉钉等都可以）
-                                    </p>
-                                </div>
-
-                                <div class="bg-white/10 rounded-xl p-4">
-                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
-                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">2</span>
-                                        创建房间并分享房间号
-                                    </h4>
-                                    <p class="text-sm text-white/90 ml-8">
-                                        你先创建游戏房间，获得6位房间号，然后把房间号告诉朋友
-                                    </p>
-                                </div>
-
-                                <div class="bg-white/10 rounded-xl p-4">
-                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
-                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">3</span>
-                                        朋友打开网址并加入
-                                    </h4>
-                                    <p class="text-sm text-white/90 ml-8">
-                                        朋友们打开你分享的网址，点击"加入房间"，输入房间号即可一起玩！
-                                    </p>
-                                </div>
-
-                                <div class="bg-green-500/20 border-2 border-green-400/50 rounded-xl p-4 mt-4">
-                                    <p class="text-sm text-green-200">
-                                        ✅ <strong>重要：</strong>所有朋友必须打开<strong>同一个网页地址</strong>，这样才能连接到同一个房间！
-                                    </p>
-                                </div>
-                            </div>
-
-                            <button id="closeHelpBtn" class="w-full mt-6 bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-3 rounded-xl font-bold text-lg shadow-lg">
-                                明白了
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }
-
             getCreateHTML() {
                 return `
-                    <div class="min-h-screen bg-gradient-to-br from-blue-900 via-purple-800 to-pink-700 flex items-center justify-center p-4">
-                        <div class="max-w-md w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
-                            <button id="backBtn" class="mb-6 text-white/80 hover:text-white flex items-center gap-2 transition">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        <div class="relative max-w-md w-full">
+                            <button id="backBtn" class="absolute top-0 left-0 text-white hover:text-yellow-300 transition mb-6">
+                                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 17l-5-5m0 0l5-5m-5 5h12"/>
                                 </svg>
-                                返回
                             </button>
+                            
+                            <div class="text-center mb-8 animate-fadeIn">
+                                <h2 class="text-4xl font-black text-white mb-2" style="font-family: Impact, sans-serif; text-shadow: 3px 3px 0px rgba(0,0,0,0.3);">
+                                    创建游戏房间
+                                </h2>
+                                <p class="text-pink-100">设置你的游戏信息</p>
+                            </div>
 
-                            <h2 class="text-4xl font-black text-white mb-8 text-center" style="font-family: Impact, sans-serif">
-                                创建房间
-                            </h2>
-
-                            <div class="space-y-6">
-                                <div>
-                                    <label class="block text-white font-bold mb-2 text-lg">你的名字</label>
-                                    <input id="playerNameInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg" placeholder="输入名字">
+                            <div class="bg-white/10 backdrop-blur rounded-2xl p-6 border-2 border-white/20">
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-yellow-300 font-bold mb-2">你的名字</label>
+                                        <input 
+                                            id="playerNameInput" 
+                                            type="text" 
+                                            placeholder="输入你的昵称" 
+                                            class="w-full bg-white/20 border-2 border-yellow-400/50 rounded-xl py-4 px-4 text-white placeholder-white/60 focus:outline-none focus:border-yellow-300 transition"
+                                            maxlength="10"
+                                        >
+                                    </div>
+                                    
+                                    <div>
+                                        <label class="block text-yellow-300 font-bold mb-2">游戏人数</label>
+                                        <select 
+                                            id="playerCountSelect" 
+                                            class="w-full bg-white/20 border-2 border-yellow-400/50 rounded-xl py-4 px-4 text-white focus:outline-none focus:border-yellow-300 transition appearance-none bg-no-repeat bg-right pr-8"
+                                            style="background-image: url('data:image/svg+xml;charset=US-ASCII,<svg width=\"20\" height=\"20\" xmlns=\"http://www.w3.org/2000/svg\"><path d=\"M5 7l5 5 5-5z\" fill=\"%23ffffff\"/></svg>');"
+                                        >
+                                            <option value="2" class="bg-purple-900">2 人</option>
+                                            <option value="3" class="bg-purple-900">3 人</option>
+                                            <option value="4" class="bg-purple-900">4 人</option>
+                                            <option value="5" class="bg-purple-900">5 人</option>
+                                            <option value="6" class="bg-purple-900">6 人</option>
+                                            <option value="7" class="bg-purple-900">7 人</option>
+                                            <option value="8" class="bg-purple-900">8 人</option>
+                                        </select>
+                                    </div>
+                                    
+                                    <button 
+                                        id="createRoomBtn" 
+                                        class="w-full bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 mt-6"
+                                    >
+                                        创建房间
+                                    </button>
                                 </div>
-
-                                <div>
-                                    <label class="block text-white font-bold mb-2 text-lg">玩家人数</label>
-                                    <select id="playerCountSelect" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white focus:outline-none focus:border-yellow-300 text-lg">
-                                        <option value="2" class="bg-purple-900">2 人</option>
-                                        <option value="3" class="bg-purple-900">3 人</option>
-                                        <option value="4" class="bg-purple-900" selected>4 人</option>
-                                        <option value="5" class="bg-purple-900">5 人</option>
-                                        <option value="6" class="bg-purple-900">6 人</option>
-                                        <option value="7" class="bg-purple-900">7 人</option>
-                                        <option value="8" class="bg-purple-900">8 人</option>
-                                    </select>
-                                </div>
-
-                                <button id="createRoomBtn" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
-                                    创建房间
-                                </button>
                             </div>
                         </div>
                     </div>
@@ -514,33 +619,53 @@
 
             getJoinHTML() {
                 return `
-                    <div class="min-h-screen bg-gradient-to-br from-teal-900 via-blue-800 to-indigo-700 flex items-center justify-center p-4">
-                        <div class="max-w-md w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
-                            <button id="backBtn" class="mb-6 text-white/80 hover:text-white flex items-center gap-2 transition">
-                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        <div class="relative max-w-md w-full">
+                            <button id="backBtn" class="absolute top-0 left-0 text-white hover:text-yellow-300 transition mb-6">
+                                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 17l-5-5m0 0l5-5m-5 5h12"/>
                                 </svg>
-                                返回
                             </button>
+                            
+                            <div class="text-center mb-8 animate-fadeIn">
+                                <h2 class="text-4xl font-black text-white mb-2" style="font-family: Impact, sans-serif; text-shadow: 3px 3px 0px rgba(0,0,0,0.3);">
+                                    加入游戏房间
+                                </h2>
+                                <p class="text-pink-100">输入房间号和你的名字</p>
+                            </div>
 
-                            <h2 class="text-4xl font-black text-white mb-8 text-center" style="font-family: Impact, sans-serif">
-                                加入房间
-                            </h2>
-
-                            <div class="space-y-6">
-                                <div>
-                                    <label class="block text-white font-bold mb-2 text-lg">你的名字</label>
-                                    <input id="playerNameInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg" placeholder="输入名字">
+                            <div class="bg-white/10 backdrop-blur rounded-2xl p-6 border-2 border-white/20">
+                                <div class="space-y-4">
+                                    <div>
+                                        <label class="block text-yellow-300 font-bold mb-2">你的名字</label>
+                                        <input 
+                                            id="playerNameInput" 
+                                            type="text" 
+                                            placeholder="输入你的昵称" 
+                                            class="w-full bg-white/20 border-2 border-pink-400/50 rounded-xl py-4 px-4 text-white placeholder-white/60 focus:outline-none focus:border-pink-300 transition"
+                                            maxlength="10"
+                                        >
+                                    </div>
+                                    
+                                    <div>
+                                        <label class="block text-yellow-300 font-bold mb-2">房间号</label>
+                                        <input 
+                                            id="roomCodeInput" 
+                                            type="text" 
+                                            placeholder="输入6位房间号" 
+                                            class="w-full bg-white/20 border-2 border-pink-400/50 rounded-xl py-4 px-4 text-white placeholder-white/60 focus:outline-none focus:border-pink-300 transition"
+                                            maxlength="6"
+                                        >
+                                    </div>
+                                    
+                                    <button 
+                                        id="joinRoomBtn" 
+                                        class="w-full bg-gradient-to-r from-pink-500 to-purple-600 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 mt-6"
+                                    >
+                                        加入房间
+                                    </button>
                                 </div>
-
-                                <div>
-                                    <label class="block text-white font-bold mb-2 text-lg">房间号</label>
-                                    <input id="roomCodeInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg uppercase tracking-widest" placeholder="输入房间号" maxlength="6">
-                                </div>
-
-                                <button id="joinRoomBtn" class="w-full bg-gradient-to-r from-pink-400 to-purple-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
-                                    加入游戏
-                                </button>
                             </div>
                         </div>
                     </div>
@@ -548,209 +673,242 @@
             }
 
             getLobbyHTML() {
-                const isHost = this.gameData.players[0].id === this.currentPlayerId;
+                if (!this.gameData) return this.getHomeHTML();
                 
+                const playersList = this.gameData.players.map((player, index) => `
+                    <div class="flex items-center gap-3 p-3 bg-white/10 rounded-xl border border-white/20 animate-slideIn" style="animation-delay: ${index * 0.1}s">
+                        <div class="w-10 h-10 rounded-full bg-gradient-to-r from-yellow-400 to-orange-500 flex items-center justify-center font-bold text-gray-900">
+                            ${index + 1}
+                        </div>
+                        <span class="text-white font-bold text-lg">${player.name}</span>
+                    </div>
+                `).join('');
+
                 return `
-                    <div class="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-800 to-pink-700 flex items-center justify-center p-4">
-                        <div class="max-w-2xl w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
-                            <div class="text-center mb-8">
-                                <h2 class="text-3xl font-black text-white mb-2" style="font-family: Impact, sans-serif">
-                                    等待玩家加入
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex flex-col items-center justify-start p-4 pt-8">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        <div class="relative max-w-md w-full">
+                            <button id="backBtn" class="absolute top-0 left-0 text-white hover:text-yellow-300 transition mb-6">
+                                <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 17l-5-5m0 0l5-5m-5 5h12"/>
+                                </svg>
+                            </button>
+                            
+                            <div class="text-center mb-6 animate-fadeIn">
+                                <h2 class="text-4xl font-black text-white mb-2" style="font-family: Impact, sans-serif; text-shadow: 3px 3px 0px rgba(0,0,0,0.3);">
+                                    房间 ${this.gameData.roomCode}
                                 </h2>
-                                <div class="inline-flex items-center gap-3 bg-yellow-400 text-gray-900 px-6 py-3 rounded-xl mt-4">
-                                    <span class="font-black text-2xl tracking-widest">${this.roomCode}</span>
-                                    <button id="copyBtn" class="p-2 bg-gray-900 text-yellow-400 rounded-lg hover:bg-gray-800 transition" title="复制房间号">
-                                        ${this.copied ? `
-                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
-                                            </svg>
-                                        ` : `
-                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
-                                            </svg>
-                                        `}
-                                    </button>
-                                </div>
-                                <p class="text-white/80 mt-3">
-                                    ${this.copied ? '✅ 已复制房间号' : '点击复制按钮分享房间号'}
-                                </p>
+                                <p class="text-pink-100">等待玩家加入 (${this.gameData.players.length}/${this.gameData.maxPlayers})</p>
                             </div>
 
-                            <div class="bg-white/5 rounded-2xl p-6 mb-6">
-                                <h3 class="text-white font-bold text-xl mb-4 flex items-center gap-2">
-                                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>
+                            <!-- 复制房间号按钮 -->
+                            <div class="flex items-center justify-center mb-6">
+                                <button 
+                                    id="copyBtn" 
+                                    class="flex items-center gap-2 bg-white/10 backdrop-blur rounded-xl py-2 px-6 border border-white/20 text-white hover:bg-white/20 transition"
+                                >
+                                    <svg class="w-5 h-5 ${this.copied ? 'text-green-400' : 'text-yellow-300'}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        ${this.copied ? 
+                                            '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>' : 
+                                            '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1M8 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M8 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2"/>'
+                                        }
                                     </svg>
-                                    玩家列表 (${this.gameData.players.length}/${this.gameData.maxPlayers})
-                                </h3>
-                                <div class="space-y-3">
-                                    ${this.gameData.players.map((player, index) => `
-                                        <div class="bg-white/10 rounded-xl p-4 flex items-center justify-between animate-slideIn" style="animation-delay: ${index * 0.1}s">
-                                            <div class="flex items-center gap-3">
-                                                <div class="w-10 h-10 bg-gradient-to-br from-yellow-400 to-orange-500 rounded-full flex items-center justify-center text-white font-bold">
-                                                    ${index + 1}
-                                                </div>
-                                                <span class="text-white font-bold text-lg">${player.name}</span>
-                                            </div>
-                                            ${index === 0 ? `
-                                                <span class="bg-yellow-400 text-gray-900 px-3 py-1 rounded-lg text-sm font-bold">
-                                                    房主
-                                                </span>
-                                            ` : ''}
-                                        </div>
-                                    `).join('')}
+                                    <span>${this.copied ? '已复制！' : '复制房间号'}</span>
+                                </button>
+                            </div>
+
+                            <!-- 玩家列表 -->
+                            <div class="bg-white/5 backdrop-blur rounded-2xl p-4 border-2 border-white/20 mb-6">
+                                <h3 class="text-yellow-300 font-bold mb-4">当前玩家</h3>
+                                <div class="space-y-2">
+                                    ${playersList || '<p class="text-white text-center">暂无玩家</p>'}
                                 </div>
                             </div>
 
-                            ${isHost ? `
-                                <button id="startGameBtn" ${this.gameData.players.length < 2 ? 'disabled' : ''} class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                            <!-- 开始游戏按钮（仅房主显示） -->
+                            ${this.gameData.players[0]?.id === this.currentPlayerId ? `
+                                <button 
+                                    id="startGameBtn" 
+                                    class="w-full bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95"
+                                    ${this.gameData.players.length < 2 ? 'disabled' : ''}
+                                    style="${this.gameData.players.length < 2 ? 'opacity: 0.5; cursor: not-allowed;' : ''}"
+                                >
                                     开始游戏
                                 </button>
-                            ` : `
-                                <p class="text-center text-white/60 text-lg">等待房主开始游戏...</p>
-                            `}
+                            ` : ''}
                         </div>
                     </div>
                 `;
             }
 
             getPlayingHTML() {
+                if (!this.gameData) return this.getHomeHTML();
+                
                 const currentPlayer = this.gameData.players.find(p => p.id === this.currentPlayerId);
-                const otherPlayers = this.gameData.players.filter(p => p.id !== this.currentPlayerId);
+                const isWinner = this.gameData.winner === currentPlayer?.name;
 
-                if (this.gameData.winner) {
-                    return `
-                        <div class="min-h-screen bg-gradient-to-br from-yellow-400 via-orange-500 to-red-500 flex items-center justify-center p-4">
-                            <div class="max-w-lg w-full text-center">
-                                <svg class="w-32 h-32 text-white mx-auto mb-6 animate-bounce" fill="currentColor" viewBox="0 0 24 24">
-                                    <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
-                                </svg>
-                                <h1 class="text-6xl font-black text-white mb-4" style="font-family: Impact, sans-serif; text-shadow: 4px 4px 0px rgba(0,0,0,0.3)">
-                                    游戏结束！
-                                </h1>
-                                <p class="text-3xl text-white mb-8">
-                                    🎉 ${this.gameData.winner} 获胜！
-                                </p>
-                                
-                                <div class="space-y-4">
-                                    <button id="truthOrDareBtn" class="w-full bg-gradient-to-r from-purple-500 to-pink-600 text-white py-5 rounded-2xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3">
-                                        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
-                                        </svg>
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex flex-col items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        <div class="relative max-w-md w-full text-center">
+                            ${isWinner ? `
+                                <div class="animate-fadeIn">
+                                    <h2 class="text-5xl font-black text-yellow-300 mb-4" style="font-family: Impact, sans-serif; text-shadow: 4px 4px 0px rgba(0,0,0,0.3);">
+                                        恭喜你赢了！🎉
+                                    </h2>
+                                    <p class="text-white text-xl mb-8">你猜对了：<span class="font-bold text-yellow-200">${currentPlayer.word}</span></p>
+                                    
+                                    <button 
+                                        id="truthOrDareBtn" 
+                                        class="w-full bg-gradient-to-r from-pink-500 to-purple-600 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 mb-4"
+                                    >
                                         真心话大冒险
                                     </button>
-
-                                    <button id="returnHome" class="w-full bg-white/20 backdrop-blur text-white py-4 rounded-2xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95">
+                                    
+                                    <button 
+                                        id="returnHome" 
+                                        class="w-full bg-white/20 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95"
+                                    >
                                         返回主页
                                     </button>
                                 </div>
-                            </div>
-                        </div>
-                    `;
-                }
-
-                return `
-                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 p-4">
-                        <div class="max-w-4xl mx-auto py-8">
-                            <!-- 你的词语 -->
-                            <div class="bg-white/10 backdrop-blur-lg rounded-3xl p-6 mb-6 border-2 border-white/20">
-                                <h2 class="text-2xl font-black text-white mb-4 flex items-center gap-2">
-                                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/>
-                                    </svg>
-                                    你的词语
-                                </h2>
-                                <div class="bg-gradient-to-r from-red-500 to-pink-600 rounded-2xl p-8 text-center">
-                                    <p class="text-white text-xl mb-2">你看不到自己的词语</p>
-                                    <p class="text-white/80">猜猜头顶是什么吧！</p>
-                                </div>
-                                
-                                <div class="mt-6">
-                                    <input id="guessInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg mb-3" placeholder="输入你的猜测">
-                                    <button id="guessBtn" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-3 rounded-xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95">
-                                        提交猜测
+                            ` : `
+                                <div class="animate-fadeIn">
+                                    <h2 class="text-4xl font-black text-white mb-6" style="font-family: Impact, sans-serif; text-shadow: 3px 3px 0px rgba(0,0,0,0.3);">
+                                        猜猜你的词是什么？
+                                    </h2>
+                                    
+                                    <div class="bg-white/10 backdrop-blur rounded-2xl p-6 border-2 border-white/20 mb-8">
+                                        <p class="text-white text-lg mb-4">其他人正在描述这个词，你来猜！</p>
+                                        <div class="flex items-center justify-center gap-3 mb-6">
+                                            <input 
+                                                id="guessInput" 
+                                                type="text" 
+                                                placeholder="输入你的猜测" 
+                                                class="w-full bg-white/20 border-2 border-yellow-400/50 rounded-xl py-4 px-4 text-white placeholder-white/60 focus:outline-none focus:border-yellow-300 transition text-center text-xl"
+                                            >
+                                        </div>
+                                        <button 
+                                            id="guessBtn" 
+                                            class="w-full bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-3 rounded-xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95"
+                                        >
+                                            提交答案
+                                        </button>
+                                    </div>
+                                    
+                                    <button 
+                                        id="returnHome" 
+                                        class="w-full bg-white/20 text-white py-3 rounded-xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95"
+                                    >
+                                        退出游戏
                                     </button>
                                 </div>
-                            </div>
-
-                            <!-- 其他玩家的词语 -->
-                            <div class="bg-white/10 backdrop-blur-lg rounded-3xl p-6 border-2 border-white/20">
-                                <h2 class="text-2xl font-black text-white mb-4 flex items-center gap-2">
-                                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
-                                    </svg>
-                                    其他玩家的词语
-                                </h2>
-                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                    ${otherPlayers.map(player => `
-                                        <div class="rounded-2xl p-5 ${player.guessed ? 'bg-green-500/30 border-2 border-green-400' : 'bg-white/10 border-2 border-white/20'}">
-                                            <div class="flex items-center justify-between mb-3">
-                                                <span class="text-white font-bold text-lg">${player.name}</span>
-                                                ${player.guessed ? `
-                                                    <span class="bg-green-400 text-gray-900 px-2 py-1 rounded-lg text-xs font-bold">
-                                                        已猜中
-                                                    </span>
-                                                ` : ''}
-                                            </div>
-                                            <div class="bg-gradient-to-r from-yellow-400 to-orange-500 rounded-xl p-4 text-center">
-                                                <p class="text-gray-900 font-black text-2xl" style="font-family: Impact, sans-serif">
-                                                    ${player.word}
-                                                </p>
-                                            </div>
-                                        </div>
-                                    `).join('')}
-                                </div>
-                            </div>
-
-                            <!-- 真心话大冒险按钮 -->
-                            <button id="truthOrDareBtn" class="w-full mt-6 bg-gradient-to-r from-purple-500 to-pink-600 text-white py-4 rounded-2xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3">
-                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
-                                </svg>
-                                真心话大冒险
-                            </button>
+                            `}
                         </div>
                     </div>
                 `;
             }
 
             getTruthOrDareHTML() {
+                if (!this.truthOrDareData) return this.getPlayingHTML();
+                
+                const typeText = this.truthOrDareData.type === 'truth' ? '真心话' : '大冒险';
+                const typeColor = this.truthOrDareData.type === 'truth' ? 'from-pink-500 to-purple-600' : 'from-yellow-400 to-orange-500';
+
                 return `
-                    <div class="min-h-screen bg-gradient-to-br from-pink-900 via-purple-800 to-indigo-700 flex items-center justify-center p-4">
-                        <div class="max-w-lg w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
-                            <div class="text-center mb-8">
-                                <svg class="w-20 h-20 text-yellow-300 mx-auto mb-4 animate-spin" style="animation-duration: 3s" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
-                                </svg>
-                                <h2 class="text-4xl font-black text-white mb-6" style="font-family: Impact, sans-serif">
-                                    ${this.truthOrDareData.type === 'truth' ? '真心话' : '大冒险'}
-                                </h2>
-                            </div>
-
-                            <div class="bg-gradient-to-r from-yellow-400 to-orange-500 rounded-2xl p-6 mb-6">
-                                <p class="text-gray-900 font-bold text-2xl text-center mb-2">
-                                    ${this.truthOrDareData.player}
-                                </p>
-                                <p class="text-gray-800 text-center">被选中了！</p>
-                            </div>
-
-                            <div class="bg-white/10 rounded-2xl p-6 mb-8">
-                                <p class="text-white text-xl text-center leading-relaxed">
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex flex-col items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        <div class="relative max-w-md w-full text-center animate-fadeIn">
+                            <h2 class="text-4xl font-black text-white mb-2" style="font-family: Impact, sans-serif; text-shadow: 3px 3px 0px rgba(0,0,0,0.3);">
+                                ${this.truthOrDareData.player} 的${typeText}
+                            </h2>
+                            <div class="bg-white/10 backdrop-blur rounded-2xl p-8 border-2 border-white/20 my-8">
+                                <p class="text-white text-xl font-bold">
                                     ${this.truthOrDareData.challenge}
                                 </p>
                             </div>
+                            
+                            <div class="space-y-4">
+                                <button 
+                                    id="continuePlaying" 
+                                    class="w-full bg-gradient-to-r ${typeColor} text-${this.truthOrDareData.type === 'truth' ? 'white' : 'gray-900'} py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95"
+                                >
+                                    继续游戏
+                                </button>
+                                
+                                <button 
+                                    id="returnHome" 
+                                    class="w-full bg-white/20 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95"
+                                >
+                                    返回主页
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
 
-                            <button id="continuePlaying" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
-                                继续游戏
+            getHelpModalHTML() {
+                return `
+                    <div id="helpOverlay" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-gradient-to-br from-purple-900 to-pink-900 rounded-3xl p-8 max-w-lg w-full border-2 border-white/30 shadow-2xl" onclick="event.stopPropagation()">
+                            <button id="closeHelpBtn" class="absolute top-4 right-4 text-white hover:text-yellow-300 transition">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
                             </button>
+                            
+                            <h3 class="text-3xl font-black text-white mb-6 text-center" style="font-family: Impact, sans-serif">
+                                📱 如何和朋友一起玩？
+                            </h3>
+                            
+                            <div class="space-y-4 text-white">
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+                                        </svg>
+                                        第一步：创建房间
+                                    </h4>
+                                    <p class="text-white/90">点击「创建游戏」，输入你的名字，选择人数，点击「创建房间」获得6位房间号。</p>
+                                </div>
+                                
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                                        </svg>
+                                        第二步：分享房间号
+                                    </h4>
+                                    <p class="text-white/90">把房间号和游戏网址发给朋友，朋友打开网址后点击「加入房间」。</p>
+                                </div>
+                                
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
+                                        </svg>
+                                        第三步：开始游戏
+                                    </h4>
+                                    <p class="text-white/90">等所有朋友加入后，房主点击「开始游戏」，就可以开始猜词啦！</p>
+                                </div>
+                                
+                                <div class="bg-yellow-400/20 rounded-xl p-4 border border-yellow-400/50 mt-6">
+                                    <h4 class="font-bold text-yellow-300 mb-2">💡 小提示</h4>
+                                    <ul class="text-white/90 list-disc list-inside space-y-1">
+                                        <li>房间号不区分大小写，输入时会自动转为大写</li>
+                                        <li>房间会保留1小时，过期后需要重新创建</li>
+                                        <li>游戏数据保存在浏览器中，刷新页面不会丢失</li>
+                                    </ul>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 `;
             }
         }
 
-        // 启动游戏
+        // 初始化游戏
         const game = new GameState();
         game.render();
     </script>
