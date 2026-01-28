@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>朋友聚会头顶词语互猜</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>朋友聚会头顶词语互猜</h1>
+        
+        <!-- 初始页面 -->
+        <div id="initial-screen" class="screen">
+            <button id="create-game">创建游戏</button>
+            <button id="join-game">加入房间</button>
+        </div>
+        
+        <!-- 创建游戏页面 -->
+        <div id="create-screen" class="screen hidden">
+            <h2>创建游戏</h2>
+            <div class="form-group">
+                <label for="player-count">人数:</label>
+                <input type="number" id="player-count" min="2" max="10" value="4">
+            </div>
+            <button id="start-game">开始游戏</button>
+            <button id="back-from-create">返回</button>
+        </div>
+        
+        <!-- 加入游戏页面 -->
+        <div id="join-screen" class="screen hidden">
+            <h2>加入房间</h2>
+            <div class="form-group">
+                <label for="room-code">房间号:</label>
+                <input type="text" id="room-code">
+            </div>
+            <button id="join-room">加入</button>
+            <button id="back-from-join">返回</button>
+        </div>
+        
+        <!-- 房间信息页面 -->
+        <div id="room-info-screen" class="screen hidden">
+            <h2>房间信息</h2>
+            <p>房间号: <span id="room-code-display"></span></p>
+            <p>等待其他玩家加入...</p>
+            <button id="back-from-room-info">返回</button>
+        </div>
+        
+        <!-- 游戏页面 -->
+        <div id="game-screen" class="screen hidden">
+            <h2>游戏中</h2>
+            <div id="game-info">
+                <p>房间号: <span id="game-room-code"></span></p>
+                <p>当前回合: <span id="current-turn"></span></p>
+                <p>你的词语: <span id="your-word">???</span></p>
+            </div>
+            
+            <div id="players-container">
+                <h3>其他玩家的词语</h3>
+                <div id="players-list"></div>
+            </div>
+            
+            <div id="guess-container" class="hidden">
+                <h3>猜测你的词语</h3>
+                <input type="text" id="guess-input" placeholder="输入你的猜测">
+                <button id="submit-guess">提交猜测</button>
+            </div>
+            
+            <button id="back-from-game">返回</button>
+        </div>
+        
+        <!-- 胜利页面 -->
+        <div id="win-screen" class="screen hidden">
+            <h2>游戏结束</h2>
+            <p id="win-message"></p>
+            <button id="play-again">再玩一次</button>
+            <button id="back-from-win">返回首页</button>
+        </div>
+        
+        <!-- 真心话大冒险页面 -->
+        <div id="truth-dare-screen" class="screen hidden">
+            <h2>真心话大冒险</h2>
+            <p id="truth-dare-message"></p>
+            <button id="back-to-home">返回首页</button>
+        </div>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
