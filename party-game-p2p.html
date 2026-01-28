@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>头顶猜词 - 在线联机版</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        .animate-fadeIn { animation: fadeIn 0.8s ease-out; }
+        .animate-slideIn { animation: slideIn 0.3s ease-out; }
+    </style>
+</head>
+<body>
+    <div id="app"></div>
+
+    <script>
+        // 词语库
+        const wordPool = [
+            '大象', '钢琴', '火箭', '冰淇淋', '超人', '熊猫', '汉堡', '闪电',
+            '彩虹', '恐龙', '蜘蛛侠', '西瓜', '火车', '企鹅', '电吉他', '独角兽',
+            '寿司', '热气球', '海豚', '魔方', '棒棒糖', '降落伞', '章鱼', '火山',
+            '滑板', '长颈鹿', '摩托车', '甜甜圈', '直升机', '考拉', '披萨', '帆船'
+        ];
+
+        // 真心话大冒险库
+        const truthOrDarePool = {
+            truth: [
+                '说出你最尴尬的一次经历',
+                '分享你暗恋过的人的名字',
+                '说出你做过最后悔的事',
+                '透露你最不想让别人知道的秘密',
+                '说出你手机里最后一张自拍',
+                '分享你最害怕的东西',
+                '说出你撒过最大的谎',
+                '透露你最想改变自己的一点'
+            ],
+            dare: [
+                '模仿一个动物叫声持续10秒',
+                '跳一段尴尬的舞蹈',
+                '用一种搞笑的口音说话直到下一轮',
+                '做20个俯卧撑',
+                '给通讯录里的第5个人发一条"我爱你"',
+                '让其他人在你脸上画一个图案',
+                '闭眼转圈10圈然后走直线',
+                '吃一勺调料(辣椒粉/芥末/醋等)'
+            ]
+        };
+
+        // P2P 网络管理
+        class P2PNetwork {
+            constructor() {
+                this.peer = null;
+                this.connections = new Map();
+                this.isHost = false;
+                this.roomCode = '';
+                this.onDataReceived = null;
+            }
+
+            async createRoom(roomCode) {
+                return new Promise((resolve, reject) => {
+                    try {
+                        // 使用房间号作为 Peer ID
+                        this.peer = new Peer('room-' + roomCode, {
+                            config: {
+                                iceServers: [
+                                    { urls: 'stun:stun.l.google.com:19302' },
+                                    { urls: 'stun:global.stun.twilio.com:3478' }
+                                ]
+                            }
+                        });
+
+                        this.peer.on('open', (id) => {
+                            console.log('房间创建成功:', id);
+                            this.isHost = true;
+                            this.roomCode = roomCode;
+                            resolve(true);
+                        });
+
+                        this.peer.on('connection', (conn) => {
+                            this.setupConnection(conn);
+                        });
+
+                        this.peer.on('error', (err) => {
+                            console.error('Peer 错误:', err);
+                            reject(err);
+                        });
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            }
+
+            async joinRoom(roomCode) {
+                return new Promise((resolve, reject) => {
+                    try {
+                        // 创建一个随机 ID 的 peer
+                        this.peer = new Peer({
+                            config: {
+                                iceServers: [
+                                    { urls: 'stun:stun.l.google.com:19302' },
+                                    { urls: 'stun:global.stun.twilio.com:3478' }
+                                ]
+                            }
+                        });
+
+                        this.peer.on('open', (id) => {
+                            console.log('连接到网络:', id);
+                            // 连接到房主
+                            const conn = this.peer.connect('room-' + roomCode);
+                            this.setupConnection(conn);
+                            
+                            conn.on('open', () => {
+                                console.log('成功加入房间');
+                                this.roomCode = roomCode;
+                                resolve(true);
+                            });
+
+                            setTimeout(() => {
+                                if (!conn.open) {
+                                    reject(new Error('连接超时'));
+                                }
+                            }, 10000);
+                        });
+
+                        this.peer.on('error', (err) => {
+                            console.error('加入失败:', err);
+                            reject(err);
+                        });
+                    } catch (err) {
+                        reject(err);
+                    }
+                });
+            }
+
+            setupConnection(conn) {
+                conn.on('open', () => {
+                    console.log('连接建立:', conn.peer);
+                    this.connections.set(conn.peer, conn);
+                });
+
+                conn.on('data', (data) => {
+                    console.log('收到数据:', data);
+                    if (this.onDataReceived) {
+                        this.onDataReceived(data);
+                    }
+                    // 如果是房主，广播给其他人
+                    if (this.isHost && data.type !== 'broadcast') {
+                        this.broadcast({ ...data, type: 'broadcast' }, conn.peer);
+                    }
+                });
+
+                conn.on('close', () => {
+                    console.log('连接关闭:', conn.peer);
+                    this.connections.delete(conn.peer);
+                });
+            }
+
+            broadcast(data, excludePeer = null) {
+                this.connections.forEach((conn, peerId) => {
+                    if (peerId !== excludePeer && conn.open) {
+                        conn.send(data);
+                    }
+                });
+            }
+
+            send(data) {
+                if (this.isHost) {
+                    this.broadcast(data);
+                } else {
+                    // 非房主发送给房主
+                    this.connections.forEach((conn) => {
+                        if (conn.open) {
+                            conn.send(data);
+                        }
+                    });
+                }
+            }
+
+            destroy() {
+                this.connections.forEach(conn => conn.close());
+                this.connections.clear();
+                if (this.peer) {
+                    this.peer.destroy();
+                }
+            }
+        }
+
+        // 游戏状态管理
+        class GameState {
+            constructor() {
+                this.network = new P2PNetwork();
+                this.screen = 'home';
+                this.roomCode = '';
+                this.playerName = '';
+                this.playerCount = 4;
+                this.gameData = null;
+                this.currentPlayerId = null;
+                this.guessInput = '';
+                this.truthOrDareData = null;
+                this.showHelp = false;
+                this.copied = false;
+                this.connecting = false;
+
+                this.network.onDataReceived = (data) => this.handleNetworkData(data);
+            }
+
+            handleNetworkData(data) {
+                if (data.type === 'gameUpdate' || data.type === 'broadcast') {
+                    this.gameData = data.gameData;
+                    if (this.gameData.started && this.screen === 'lobby') {
+                        this.screen = 'playing';
+                    }
+                    this.render();
+                }
+            }
+
+            async createRoom() {
+                if (!this.playerName.trim()) {
+                    alert('请输入你的名字');
+                    return;
+                }
+
+                this.connecting = true;
+                this.render();
+
+                const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+                const playerId = Math.random().toString(36).substring(2, 15);
+
+                try {
+                    await this.network.createRoom(code);
+                    
+                    const words = [...wordPool].sort(() => Math.random() - 0.5).slice(0, this.playerCount);
+                    
+                    this.gameData = {
+                        roomCode: code,
+                        maxPlayers: this.playerCount,
+                        players: [{
+                            id: playerId,
+                            name: this.playerName,
+                            word: words[0],
+                            guessed: false,
+                            order: 0
+                        }],
+                        words: words,
+                        started: false,
+                        currentTurn: 0,
+                        winner: null
+                    };
+
+                    this.roomCode = code;
+                    this.currentPlayerId = playerId;
+                    this.screen = 'lobby';
+                    this.connecting = false;
+                    this.render();
+                } catch (error) {
+                    alert('创建房间失败：' + error.message);
+                    this.connecting = false;
+                    this.render();
+                }
+            }
+
+            async joinRoom() {
+                if (!this.playerName.trim() || !this.roomCode.trim()) {
+                    alert('请输入名字和房间号');
+                    return;
+                }
+
+                this.connecting = true;
+                this.render();
+
+                try {
+                    await this.network.joinRoom(this.roomCode.toUpperCase());
+
+                    const playerId = Math.random().toString(36).substring(2, 15);
+                    this.currentPlayerId = playerId;
+
+                    // 发送加入请求
+                    this.network.send({
+                        type: 'join',
+                        player: {
+                            id: playerId,
+                            name: this.playerName
+                        }
+                    });
+
+                    // 等待房主的回应
+                    const waitForGameData = new Promise((resolve) => {
+                        const checkData = setInterval(() => {
+                            if (this.gameData) {
+                                clearInterval(checkData);
+                                resolve();
+                            }
+                        }, 100);
+
+                        setTimeout(() => {
+                            clearInterval(checkData);
+                            resolve();
+                        }, 5000);
+                    });
+
+                    // 设置临时监听来接收初始游戏数据
+                    const originalHandler = this.network.onDataReceived;
+                    this.network.onDataReceived = (data) => {
+                        if (data.type === 'gameUpdate' || data.type === 'broadcast') {
+                            this.gameData = data.gameData;
+                            
+                            // 添加自己到游戏中（如果还没有的话）
+                            const existingPlayer = this.gameData.players.find(p => p.id === playerId);
+                            if (!existingPlayer) {
+                                if (this.gameData.players.length >= this.gameData.maxPlayers) {
+                                    alert('房间已满');
+                                    this.connecting = false;
+                                    this.screen = 'home';
+                                    this.render();
+                                    return;
+                                }
+
+                                if (this.gameData.started) {
+                                    alert('游戏已开始');
+                                    this.connecting = false;
+                                    this.screen = 'home';
+                                    this.render();
+                                    return;
+                                }
+
+                                const newPlayer = {
+                                    id: playerId,
+                                    name: this.playerName,
+                                    word: this.gameData.words[this.gameData.players.length],
+                                    guessed: false,
+                                    order: this.gameData.players.length
+                                };
+
+                                this.gameData.players.push(newPlayer);
+                                
+                                // 广播更新
+                                this.network.send({
+                                    type: 'gameUpdate',
+                                    gameData: this.gameData
+                                });
+                            }
+
+                            this.screen = 'lobby';
+                            this.connecting = false;
+                            this.render();
+                        }
+                        originalHandler(data);
+                    };
+
+                    await waitForGameData;
+
+                    if (!this.gameData) {
+                        alert('无法连接到房间，请检查房间号是否正确');
+                        this.connecting = false;
+                        this.screen = 'home';
+                        this.render();
+                    }
+
+                } catch (error) {
+                    alert('加入房间失败：' + error.message);
+                    this.connecting = false;
+                    this.screen = 'home';
+                    this.render();
+                }
+            }
+
+            startGame() {
+                if (this.gameData.players.length < 2) {
+                    alert('至少需要2名玩家才能开始');
+                    return;
+                }
+
+                this.gameData.started = true;
+                this.network.send({
+                    type: 'gameUpdate',
+                    gameData: this.gameData
+                });
+                this.screen = 'playing';
+                this.render();
+            }
+
+            makeGuess() {
+                if (!this.guessInput.trim()) {
+                    alert('请输入你的猜测');
+                    return;
+                }
+
+                const currentPlayer = this.gameData.players.find(p => p.id === this.currentPlayerId);
+                
+                if (this.guessInput.trim() === currentPlayer.word) {
+                    const playerIndex = this.gameData.players.findIndex(p => p.id === this.currentPlayerId);
+                    this.gameData.players[playerIndex].guessed = true;
+                    this.gameData.winner = currentPlayer.name;
+                    
+                    this.network.send({
+                        type: 'gameUpdate',
+                        gameData: this.gameData
+                    });
+                    this.guessInput = '';
+                    this.render();
+                } else {
+                    alert('猜错了！继续加油！');
+                    this.guessInput = '';
+                    this.render();
+                }
+            }
+
+            triggerTruthOrDare() {
+                const randomPlayer = this.gameData.players[Math.floor(Math.random() * this.gameData.players.length)];
+                const type = Math.random() > 0.5 ? 'truth' : 'dare';
+                const challenge = truthOrDarePool[type][Math.floor(Math.random() * truthOrDarePool[type].length)];
+                
+                this.truthOrDareData = {
+                    player: randomPlayer.name,
+                    type: type,
+                    challenge: challenge
+                };
+                this.screen = 'truthOrDare';
+                this.render();
+            }
+
+            copyRoomCode() {
+                navigator.clipboard.writeText(this.roomCode);
+                this.copied = true;
+                this.render();
+                setTimeout(() => {
+                    this.copied = false;
+                    this.render();
+                }, 2000);
+            }
+
+            render() {
+                const app = document.getElementById('app');
+                app.innerHTML = this.getHTML();
+                this.attachEvents();
+            }
+
+            attachEvents() {
+                const createBtn = document.getElementById('createBtn');
+                const joinBtn = document.getElementById('joinBtn');
+                const helpBtn = document.getElementById('helpBtn');
+                
+                if (createBtn) createBtn.onclick = () => { this.screen = 'create'; this.render(); };
+                if (joinBtn) joinBtn.onclick = () => { this.screen = 'join'; this.render(); };
+                if (helpBtn) helpBtn.onclick = () => { this.showHelp = true; this.render(); };
+
+                const closeHelpBtn = document.getElementById('closeHelpBtn');
+                const helpOverlay = document.getElementById('helpOverlay');
+                if (closeHelpBtn) closeHelpBtn.onclick = () => { this.showHelp = false; this.render(); };
+                if (helpOverlay) helpOverlay.onclick = () => { this.showHelp = false; this.render(); };
+
+                const backBtn = document.getElementById('backBtn');
+                if (backBtn) backBtn.onclick = () => { this.screen = 'home'; this.render(); };
+
+                const playerNameInput = document.getElementById('playerNameInput');
+                const playerCountSelect = document.getElementById('playerCountSelect');
+                const createRoomBtn = document.getElementById('createRoomBtn');
+                
+                if (playerNameInput) {
+                    playerNameInput.value = this.playerName;
+                    playerNameInput.oninput = (e) => { this.playerName = e.target.value; };
+                }
+                if (playerCountSelect) {
+                    playerCountSelect.value = this.playerCount;
+                    playerCountSelect.onchange = (e) => { this.playerCount = Number(e.target.value); };
+                }
+                if (createRoomBtn) createRoomBtn.onclick = () => this.createRoom();
+
+                const roomCodeInput = document.getElementById('roomCodeInput');
+                const joinRoomBtn = document.getElementById('joinRoomBtn');
+                
+                if (roomCodeInput) {
+                    roomCodeInput.value = this.roomCode;
+                    roomCodeInput.oninput = (e) => { this.roomCode = e.target.value.toUpperCase(); };
+                }
+                if (joinRoomBtn) joinRoomBtn.onclick = () => this.joinRoom();
+
+                const copyBtn = document.getElementById('copyBtn');
+                if (copyBtn) copyBtn.onclick = () => this.copyRoomCode();
+
+                const startGameBtn = document.getElementById('startGameBtn');
+                if (startGameBtn) startGameBtn.onclick = () => this.startGame();
+
+                const guessInput = document.getElementById('guessInput');
+                const guessBtn = document.getElementById('guessBtn');
+                
+                if (guessInput) {
+                    guessInput.value = this.guessInput;
+                    guessInput.oninput = (e) => { this.guessInput = e.target.value; };
+                    guessInput.onkeypress = (e) => { if (e.key === 'Enter') this.makeGuess(); };
+                }
+                if (guessBtn) guessBtn.onclick = () => this.makeGuess();
+
+                const truthOrDareBtn = document.getElementById('truthOrDareBtn');
+                const continuePlaying = document.getElementById('continuePlaying');
+                const returnHome = document.getElementById('returnHome');
+                
+                if (truthOrDareBtn) truthOrDareBtn.onclick = () => this.triggerTruthOrDare();
+                if (continuePlaying) continuePlaying.onclick = () => { this.screen = 'playing'; this.render(); };
+                if (returnHome) returnHome.onclick = () => {
+                    this.network.destroy();
+                    this.screen = 'home';
+                    this.gameData = null;
+                    this.roomCode = '';
+                    this.playerName = '';
+                    this.currentPlayerId = null;
+                    this.render();
+                };
+            }
+
+            getHTML() {
+                if (this.connecting) return this.getConnectingHTML();
+                if (this.screen === 'home') return this.getHomeHTML();
+                if (this.screen === 'create') return this.getCreateHTML();
+                if (this.screen === 'join') return this.getJoinHTML();
+                if (this.screen === 'lobby') return this.getLobbyHTML();
+                if (this.screen === 'playing') return this.getPlayingHTML();
+                if (this.screen === 'truthOrDare') return this.getTruthOrDareHTML();
+            }
+
+            getConnectingHTML() {
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex items-center justify-center p-4">
+                        <div class="text-center">
+                            <div class="inline-block animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-yellow-300 mb-4"></div>
+                            <p class="text-white text-xl font-bold">连接中...</p>
+                            <p class="text-white/60 mt-2">请稍候</p>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getHomeHTML() {
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 flex items-center justify-center p-4">
+                        <div class="absolute inset-0 bg-[radial-gradient(circle_at_50%_50%,rgba(255,255,255,0.1),transparent_50%)] opacity-30"></div>
+                        
+                        ${this.showHelp ? this.getHelpModalHTML() : ''}
+                        
+                        <div class="relative max-w-lg w-full">
+                            <div class="text-center mb-12 animate-fadeIn">
+                                <div class="inline-block mb-6">
+                                    <svg class="w-20 h-20 text-yellow-300 animate-pulse mx-auto" fill="currentColor" viewBox="0 0 24 24">
+                                        <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>
+                                    </svg>
+                                </div>
+                                <h1 class="text-6xl font-black text-white mb-4 tracking-tight" style="font-family: Impact, sans-serif; text-shadow: 4px 4px 0px rgba(0,0,0,0.3);">
+                                    头顶猜词
+                                </h1>
+                                <p class="text-xl text-pink-100 font-medium">聚会必备，欢乐满满</p>
+                                <p class="text-sm text-green-300 mt-2">✨ P2P在线联机 · 无需配置</p>
+                            </div>
+
+                            <div class="bg-green-400/20 border-2 border-green-400/50 rounded-2xl p-4 mb-6 backdrop-blur">
+                                <button id="helpBtn" class="w-full flex items-center justify-between text-green-100 hover:text-white transition">
+                                    <span class="flex items-center gap-2">
+                                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                        </svg>
+                                        <span class="font-bold">全球联机 · 点击查看使用方法</span>
+                                    </span>
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                                    </svg>
+                                </button>
+                            </div>
+
+                            <div class="space-y-4">
+                                <button id="createBtn" class="w-full bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-6 rounded-2xl font-bold text-2xl shadow-2xl transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3 border-4 border-yellow-200" style="font-family: Arial Black, sans-serif">
+                                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>
+                                    </svg>
+                                    创建游戏
+                                </button>
+
+                                <button id="joinBtn" class="w-full bg-gradient-to-r from-pink-500 to-purple-600 text-white py-6 rounded-2xl font-bold text-2xl shadow-2xl transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3 border-4 border-pink-300" style="font-family: Arial Black, sans-serif">
+                                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                                    </svg>
+                                    加入房间
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getHelpModalHTML() {
+                return `
+                    <div id="helpOverlay" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                        <div class="bg-gradient-to-br from-purple-900 to-pink-900 rounded-3xl p-8 max-w-lg w-full border-2 border-white/30 shadow-2xl" onclick="event.stopPropagation()">
+                            <h3 class="text-3xl font-black text-white mb-6 text-center" style="font-family: Impact, sans-serif">
+                                🌐 在线联机说明
+                            </h3>
+                            
+                            <div class="space-y-4 text-white">
+                                <div class="bg-green-500/20 border-2 border-green-400/50 rounded-xl p-4">
+                                    <p class="text-sm text-green-200">
+                                        ✅ <strong>这个版本使用 P2P 技术</strong>
+                                    </p>
+                                    <p class="text-sm text-green-200 mt-2">
+                                        真正支持<strong>不同网络、不同城市</strong>的朋友一起玩！无需任何配置！
+                                    </p>
+                                </div>
+
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">1</span>
+                                        分享游戏网址
+                                    </h4>
+                                    <p class="text-sm text-white/90 ml-8">
+                                        把这个网页的网址发给朋友（微信、QQ等）
+                                    </p>
+                                </div>
+
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">2</span>
+                                        创建房间
+                                    </h4>
+                                    <p class="text-sm text-white/90 ml-8">
+                                        你点击"创建游戏"，获得房间号
+                                    </p>
+                                </div>
+
+                                <div class="bg-white/10 rounded-xl p-4">
+                                    <h4 class="font-bold text-yellow-300 mb-2 flex items-center gap-2">
+                                        <span class="bg-yellow-300 text-gray-900 w-6 h-6 rounded-full flex items-center justify-center text-sm">3</span>
+                                        朋友加入
+                                    </h4>
+                                    <p class="text-sm text-white/90 ml-8">
+                                        朋友打开网址，输入房间号，即可加入！
+                                    </p>
+                                </div>
+
+                                <div class="bg-yellow-500/20 border-2 border-yellow-400/50 rounded-xl p-4">
+                                    <p class="text-sm text-yellow-200">
+                                        💡 <strong>提示：</strong>如果连接失败，双方都刷新一下网页重试即可。
+                                    </p>
+                                </div>
+                            </div>
+
+                            <button id="closeHelpBtn" class="w-full mt-6 bg-gradient-to-r from-yellow-400 to-orange-500 text-gray-900 py-3 rounded-xl font-bold text-lg shadow-lg">
+                                明白了
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getCreateHTML() {
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-blue-900 via-purple-800 to-pink-700 flex items-center justify-center p-4">
+                        <div class="max-w-md w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
+                            <button id="backBtn" class="mb-6 text-white/80 hover:text-white flex items-center gap-2 transition">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                                </svg>
+                                返回
+                            </button>
+
+                            <h2 class="text-4xl font-black text-white mb-8 text-center" style="font-family: Impact, sans-serif">
+                                创建房间
+                            </h2>
+
+                            <div class="space-y-6">
+                                <div>
+                                    <label class="block text-white font-bold mb-2 text-lg">你的名字</label>
+                                    <input id="playerNameInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg" placeholder="输入名字">
+                                </div>
+
+                                <div>
+                                    <label class="block text-white font-bold mb-2 text-lg">玩家人数</label>
+                                    <select id="playerCountSelect" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white focus:outline-none focus:border-yellow-300 text-lg">
+                                        <option value="2" class="bg-purple-900">2 人</option>
+                                        <option value="3" class="bg-purple-900">3 人</option>
+                                        <option value="4" class="bg-purple-900" selected>4 人</option>
+                                        <option value="5" class="bg-purple-900">5 人</option>
+                                        <option value="6" class="bg-purple-900">6 人</option>
+                                        <option value="7" class="bg-purple-900">7 人</option>
+                                        <option value="8" class="bg-purple-900">8 人</option>
+                                    </select>
+                                </div>
+
+                                <button id="createRoomBtn" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
+                                    创建房间
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getJoinHTML() {
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-teal-900 via-blue-800 to-indigo-700 flex items-center justify-center p-4">
+                        <div class="max-w-md w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
+                            <button id="backBtn" class="mb-6 text-white/80 hover:text-white flex items-center gap-2 transition">
+                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                                </svg>
+                                返回
+                            </button>
+
+                            <h2 class="text-4xl font-black text-white mb-8 text-center" style="font-family: Impact, sans-serif">
+                                加入房间
+                            </h2>
+
+                            <div class="space-y-6">
+                                <div>
+                                    <label class="block text-white font-bold mb-2 text-lg">你的名字</label>
+                                    <input id="playerNameInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg" placeholder="输入名字">
+                                </div>
+
+                                <div>
+                                    <label class="block text-white font-bold mb-2 text-lg">房间号</label>
+                                    <input id="roomCodeInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg uppercase tracking-widest" placeholder="输入房间号" maxlength="6">
+                                </div>
+
+                                <button id="joinRoomBtn" class="w-full bg-gradient-to-r from-pink-400 to-purple-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
+                                    加入游戏
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getLobbyHTML() {
+                if (!this.gameData) return '';
+                const isHost = this.network.isHost;
+                
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-indigo-900 via-purple-800 to-pink-700 flex items-center justify-center p-4">
+                        <div class="max-w-2xl w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
+                            <div class="text-center mb-8">
+                                <h2 class="text-3xl font-black text-white mb-2" style="font-family: Impact, sans-serif">
+                                    等待玩家加入
+                                </h2>
+                                <div class="inline-flex items-center gap-3 bg-yellow-400 text-gray-900 px-6 py-3 rounded-xl mt-4">
+                                    <span class="font-black text-2xl tracking-widest">${this.roomCode}</span>
+                                    <button id="copyBtn" class="p-2 bg-gray-900 text-yellow-400 rounded-lg hover:bg-gray-800 transition" title="复制房间号">
+                                        ${this.copied ? `
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                            </svg>
+                                        ` : `
+                                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                                            </svg>
+                                        `}
+                                    </button>
+                                </div>
+                                <p class="text-white/80 mt-3">
+                                    ${this.copied ? '✅ 已复制房间号' : '点击复制按钮分享房间号'}
+                                </p>
+                            </div>
+
+                            <div class="bg-white/5 rounded-2xl p-6 mb-6">
+                                <h3 class="text-white font-bold text-xl mb-4 flex items-center gap-2">
+                                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"/>
+                                    </svg>
+                                    玩家列表 (${this.gameData.players.length}/${this.gameData.maxPlayers})
+                                </h3>
+                                <div class="space-y-3">
+                                    ${this.gameData.players.map((player, index) => `
+                                        <div class="bg-white/10 rounded-xl p-4 flex items-center justify-between animate-slideIn" style="animation-delay: ${index * 0.1}s">
+                                            <div class="flex items-center gap-3">
+                                                <div class="w-10 h-10 bg-gradient-to-br from-yellow-400 to-orange-500 rounded-full flex items-center justify-center text-white font-bold">
+                                                    ${index + 1}
+                                                </div>
+                                                <span class="text-white font-bold text-lg">${player.name}</span>
+                                            </div>
+                                            ${index === 0 ? `
+                                                <span class="bg-yellow-400 text-gray-900 px-3 py-1 rounded-lg text-sm font-bold">
+                                                    房主
+                                                </span>
+                                            ` : ''}
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+
+                            ${isHost ? `
+                                <button id="startGameBtn" ${this.gameData.players.length < 2 ? 'disabled' : ''} class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed">
+                                    开始游戏
+                                </button>
+                            ` : `
+                                <p class="text-center text-white/60 text-lg">等待房主开始游戏...</p>
+                            `}
+                        </div>
+                    </div>
+                `;
+            }
+
+            getPlayingHTML() {
+                if (!this.gameData) return '';
+                const currentPlayer = this.gameData.players.find(p => p.id === this.currentPlayerId);
+                const otherPlayers = this.gameData.players.filter(p => p.id !== this.currentPlayerId);
+
+                if (this.gameData.winner) {
+                    return `
+                        <div class="min-h-screen bg-gradient-to-br from-yellow-400 via-orange-500 to-red-500 flex items-center justify-center p-4">
+                            <div class="max-w-lg w-full text-center">
+                                <svg class="w-32 h-32 text-white mx-auto mb-6 animate-bounce" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"/>
+                                </svg>
+                                <h1 class="text-6xl font-black text-white mb-4" style="font-family: Impact, sans-serif; text-shadow: 4px 4px 0px rgba(0,0,0,0.3)">
+                                    游戏结束！
+                                </h1>
+                                <p class="text-3xl text-white mb-8">
+                                    🎉 ${this.gameData.winner} 获胜！
+                                </p>
+                                
+                                <div class="space-y-4">
+                                    <button id="truthOrDareBtn" class="w-full bg-gradient-to-r from-purple-500 to-pink-600 text-white py-5 rounded-2xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3">
+                                        <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                                        </svg>
+                                        真心话大冒险
+                                    </button>
+
+                                    <button id="returnHome" class="w-full bg-white/20 backdrop-blur text-white py-4 rounded-2xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95">
+                                        返回主页
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }
+
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-orange-700 p-4">
+                        <div class="max-w-4xl mx-auto py-8">
+                            <div class="bg-white/10 backdrop-blur-lg rounded-3xl p-6 mb-6 border-2 border-white/20">
+                                <h2 class="text-2xl font-black text-white mb-4 flex items-center gap-2">
+                                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21"/>
+                                    </svg>
+                                    你的词语
+                                </h2>
+                                <div class="bg-gradient-to-r from-red-500 to-pink-600 rounded-2xl p-8 text-center">
+                                    <p class="text-white text-xl mb-2">你看不到自己的词语</p>
+                                    <p class="text-white/80">猜猜头顶是什么吧！</p>
+                                </div>
+                                
+                                <div class="mt-6">
+                                    <input id="guessInput" type="text" class="w-full px-4 py-3 rounded-xl bg-white/20 border-2 border-white/30 text-white placeholder-white/50 focus:outline-none focus:border-yellow-300 text-lg mb-3" placeholder="输入你的猜测">
+                                    <button id="guessBtn" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-3 rounded-xl font-bold text-lg shadow-lg transform transition hover:scale-105 active:scale-95">
+                                        提交猜测
+                                    </button>
+                                </div>
+                            </div>
+
+                            <div class="bg-white/10 backdrop-blur-lg rounded-3xl p-6 border-2 border-white/20 mb-6">
+                                <h2 class="text-2xl font-black text-white mb-4 flex items-center gap-2">
+                                    <svg class="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                                    </svg>
+                                    其他玩家的词语
+                                </h2>
+                                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    ${otherPlayers.map(player => `
+                                        <div class="rounded-2xl p-5 ${player.guessed ? 'bg-green-500/30 border-2 border-green-400' : 'bg-white/10 border-2 border-white/20'}">
+                                            <div class="flex items-center justify-between mb-3">
+                                                <span class="text-white font-bold text-lg">${player.name}</span>
+                                                ${player.guessed ? `
+                                                    <span class="bg-green-400 text-gray-900 px-2 py-1 rounded-lg text-xs font-bold">
+                                                        已猜中
+                                                    </span>
+                                                ` : ''}
+                                            </div>
+                                            <div class="bg-gradient-to-r from-yellow-400 to-orange-500 rounded-xl p-4 text-center">
+                                                <p class="text-gray-900 font-black text-2xl" style="font-family: Impact, sans-serif">
+                                                    ${player.word}
+                                                </p>
+                                            </div>
+                                        </div>
+                                    `).join('')}
+                                </div>
+                            </div>
+
+                            <button id="truthOrDareBtn" class="w-full bg-gradient-to-r from-purple-500 to-pink-600 text-white py-4 rounded-2xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95 flex items-center justify-center gap-3">
+                                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                                </svg>
+                                真心话大冒险
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+
+            getTruthOrDareHTML() {
+                if (!this.truthOrDareData) return '';
+                return `
+                    <div class="min-h-screen bg-gradient-to-br from-pink-900 via-purple-800 to-indigo-700 flex items-center justify-center p-4">
+                        <div class="max-w-lg w-full bg-white/10 backdrop-blur-lg rounded-3xl p-8 shadow-2xl border-2 border-white/20">
+                            <div class="text-center mb-8">
+                                <svg class="w-20 h-20 text-yellow-300 mx-auto mb-4 animate-spin" style="animation-duration: 3s" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"/>
+                                </svg>
+                                <h2 class="text-4xl font-black text-white mb-6" style="font-family: Impact, sans-serif">
+                                    ${this.truthOrDareData.type === 'truth' ? '真心话' : '大冒险'}
+                                </h2>
+                            </div>
+
+                            <div class="bg-gradient-to-r from-yellow-400 to-orange-500 rounded-2xl p-6 mb-6">
+                                <p class="text-gray-900 font-bold text-2xl text-center mb-2">
+                                    ${this.truthOrDareData.player}
+                                </p>
+                                <p class="text-gray-800 text-center">被选中了！</p>
+                            </div>
+
+                            <div class="bg-white/10 rounded-2xl p-6 mb-8">
+                                <p class="text-white text-xl text-center leading-relaxed">
+                                    ${this.truthOrDareData.challenge}
+                                </p>
+                            </div>
+
+                            <button id="continuePlaying" class="w-full bg-gradient-to-r from-green-400 to-blue-500 text-white py-4 rounded-xl font-bold text-xl shadow-lg transform transition hover:scale-105 active:scale-95">
+                                继续游戏
+                            </button>
+                        </div>
+                    </div>
+                `;
+            }
+        }
+
+        // 启动游戏
+        const game = new GameState();
+        game.render();
+    </script>
+</body>
+</html>
